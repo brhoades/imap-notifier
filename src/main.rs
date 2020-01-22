@@ -161,20 +161,23 @@ async fn run<'a>(
                 RequestIdle => {
                     stream.write_all(". idle\r\n".as_bytes()).await?;
 
+                    info!("waiting for idling confirmation");
                     WaitIdle
                 }
                 WaitIdle => {
                     if line.contains("+ idling") {
+                        info!("idle confirmed");
                         Idle
                     } else {
                         WaitIdle
                     }
                 }
                 Idle => {
-                    if line.contains(" FETCH(FLAGS") {
+                    if line.contains("FETCH (FLAGS") {
+                        info!("Calling script");
                         let output = call_command(
                             &opt.script,
-                            vec!["FLAGS", &opt.user, &get_flags(&line)?.unwrap()],
+                            vec!["FLAGS", &opt.user, &opt.folder, &get_flags(&line)?.unwrap()],
                         )?;
 
                         debug!("STDOUT: {}", output.0);
@@ -182,7 +185,9 @@ async fn run<'a>(
                     }
 
                     if line.contains(" EXISTS") {
-                        let output = call_command(&opt.script, vec!["EXISTS", &opt.user])?;
+                        info!("Calling script");
+                        let output =
+                            call_command(&opt.script, vec!["EXISTS", &opt.user, &opt.folder])?;
 
                         debug!("STDOUT: {}", output.0);
                         debug!("STDERR: {}", output.1);
@@ -215,7 +220,7 @@ where
 fn get_flags(line: &str) -> Result<Option<String>, Error> {
     use regex::Regex;
 
-    let re = Regex::new(r#"FETCH \\(FLAGS \\(([\\ A-Za-z0-9]*?)\\)\\)"#)?;
+    let re = Regex::new(r#"FETCH ?\(FLAGS ?\(([\\ A-Za-z0-9]+?)\)\)"#)?;
     match re.captures(line) {
         Some(captures) => Ok(captures.get(0).map(|v| v.as_str().to_owned())),
         None => Ok(None),
