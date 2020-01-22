@@ -1,21 +1,22 @@
-use futures::future;
 use std::io;
 use std::io::BufReader;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use structopt::StructOpt;
-use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime;
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSNameRef, TlsConnector};
 
 use failure::Error;
 
-enum State {
-	Login(String, String),
+enum State<'a, 'b, 'c> {
+	Login(&'a String, &'b String),
 	WaitAuthenticated,
-	SelectFolder(String),
+	SelectFolder(&'c String),
 	WaitSelected,
+	RequestIdle,
+	WaitIdle,
 	Idle,
 }
 
@@ -49,48 +50,35 @@ fn main() -> Result<(), Error> {
 
 	let fut = async {
 		let stream = TcpStream::connect(host).await?;
-
 		let domain = DNSNameRef::try_from_ascii_str(
 			dnsname
 				.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?,
-		)
-		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
-
+		)?;
 		let mut stream = connector.connect(domain, stream).await?;
-		stream
-			.write_all(format!(". LOGIN \"{}\" \"{}\"\r\n", opt.user, opt.pass).as_bytes())
-			.await?;
 
-		let running = true;
-		let mut next: Option<String> = None;
-		while running {
+		let mut state = State::Login(&opt.user, &opt.pass);
+
+		loop {
 			let mut buff = std::vec::Vec::with_capacity(1024 * 1024);
 			buff.resize(128, 0);
 
-			if next.is_some() {
-				let (mut reader, mut writer) = split(stream);
-				future::select(
-					reader.read(&mut buff),
-					writer.write(next.unwrap().as_bytes()),
-				)
-				.await
-				.factor_first()
-				.0?;
-				next = None;
-				stream = reader.unsplit(writer);
-			} else {
-				stream.read(&mut buff).await?;
-			}
-			let all_lines = String::from_utf8(buff).unwrap();
-			let lines = all_lines.split("\r\n").filter(|e| e.len() != 0);
+			stream.read(&mut buff).await?;
 
-			for line in lines {
+			let lines = buff
+				.split(|c| *c == '\r' as u8 || *c == '\n' as u8)
+				.filter(|e| e.len() != 0)
+				.map(std::str::from_utf8);
+
+			for incoming_line in lines {
+				let line = incoming_line?;
+
 				println!("-> {}", line.replace("\r\n", ""));
 
 				if line.starts_with(". NO [AUTHENTICATIONFAILED]") {
 					println!("Authentication failed, quitting");
 					stream.write_all(". CLOSE\r\n".as_bytes()).await?;
 				}
+
 				if line.starts_with(". BAD") {
 					println!("Sent an invalid command.");
 					stream.write_all(". CLOSE\r\n".as_bytes()).await?;
@@ -101,34 +89,68 @@ fn main() -> Result<(), Error> {
 					return Ok(());
 				}
 
-				if line.contains("Logged in") {
-					println!("Logged in");
+				use State::*;
+				state = match state {
+					Login(user, pass) => {
+						stream
+							.write_all(format!(". LOGIN \"{}\" \"{}\"\r\n", user, pass).as_bytes())
+							.await?;
+						WaitAuthenticated
+					}
+					WaitAuthenticated => {
+						if line.contains("Logged in") {
+							SelectFolder(&opt.folder)
+						} else {
+							WaitAuthenticated
+						}
+					}
+					SelectFolder(folder) => {
+						stream
+							.write_all(format!(". select {}\r\n", folder).as_bytes())
+							.await?;
 
-					next = Some(format!(". select {}\r\n", opt.folder));
-				}
+						WaitSelected
+					}
+					WaitSelected => {
+						if line.contains("Select completed") {
+							RequestIdle
+						} else {
+							WaitSelected
+						}
+					}
+					RequestIdle => {
+						stream.write_all(". idle\r\n".as_bytes()).await?;
 
-				if line.contains("Select completed") {
-					next = Some(". idle\r\n".to_owned());
-				}
+						WaitIdle
+					}
+					WaitIdle => {
+						if line.contains("+ idling") {
+							Idle
+						} else {
+							WaitIdle
+						}
+					}
+					Idle => {
+						if line.contains(" FETCH(FLAGS") {
+							let output = call_command(
+								&opt.script,
+								vec!["FLAGS", &opt.user, &get_flags(&line)?.unwrap()],
+							)?;
 
-				if line.contains(" FETCH(FLAGS") {
-					let output = call_command(
-						&opt.script,
-						vec!["FLAGS", &opt.user, &get_flags(line)?.unwrap()],
-					)?;
+							println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
+						}
 
-					println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
-				}
+						if line.contains(" EXISTS") {
+							let output = call_command(&opt.script, vec!["EXISTS", &opt.user])?;
 
-				if line.contains(" EXISTS") {
-					let output = call_command(&opt.script, vec!["EXISTS", &opt.user])?;
+							println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
+						}
 
-					println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
-				}
+						Idle
+					}
+				};
 			}
 		}
-
-		Ok(())
 	};
 
 	runtime.block_on(fut)
@@ -156,22 +178,6 @@ struct Options {
 	// ca file to use for custom cert.
 	cafile: Option<std::path::PathBuf>,
 }
-
-/*
-->
--> * 64 EXISTS
-->
--> * 63 FETCH (FLAGS (\Seen))
-->
--> * 63 FETCH (FLAGS (\Flagged \Seen))
-->
--> * 59 FETCH (FLAGS (\Seen))
-->
--> * 59 FETCH (FLAGS (\Answered \Seen))
--> * 65 EXISTS
-->
--> * OK Still here
-*/
 
 fn call_command<T, S>(command: &PathBuf, args: T) -> Result<(String, String), Error>
 where
