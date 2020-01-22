@@ -9,6 +9,7 @@ use tokio::runtime;
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSNameRef, TlsConnector};
 
 use failure::{format_err, Error};
+use log::{debug, error, info};
 
 enum State<'a, 'b, 'c> {
 	Login(&'a String, &'b String),
@@ -25,6 +26,10 @@ enum State<'a, 'b, 'c> {
 struct Options {
 	// host of imap server
 	host: String,
+
+	// port
+	#[structopt(short = "p", long = "port", default_value = "993")]
+	port: i16,
 
 	// username to use
 	user: String,
@@ -44,6 +49,9 @@ struct Options {
 }
 
 fn main() -> Result<(), Error> {
+	pretty_env_logger::init();
+
+	debug!("imap notifier start");
 	let opt = Options::from_args();
 
 	let mut runtime = runtime::Builder::new()
@@ -65,11 +73,8 @@ fn main() -> Result<(), Error> {
 	}
 	let connector = TlsConnector::from(std::sync::Arc::new(config));
 	let host = opt.host.clone();
-	let domain = DNSNameRef::try_from_ascii_str(
-		host.split(":")
-			.next()
-			.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?,
-	)?;
+	let domain = DNSNameRef::try_from_ascii_str(&host)
+		.map_err(|e| format_err!("error when parsing dns name '{}': {}", opt.host, e))?;
 
 	runtime.block_on(run(opt, connector, domain))
 }
@@ -79,8 +84,7 @@ async fn run<'a>(
 	connector: TlsConnector,
 	domain: DNSNameRef<'a>,
 ) -> Result<(), Error> {
-	let host = opt
-		.host
+	let host = format!("{}:{}", opt.host, opt.port)
 		.to_socket_addrs()?
 		.next()
 		.ok_or(format_err!("Unable to parse host"))?;
@@ -104,20 +108,20 @@ async fn run<'a>(
 		for incoming_line in lines {
 			let line = incoming_line?;
 
-			println!("-> {}", line.replace("\r\n", ""));
+			info!("-> {}", line.replace("\r\n", ""));
 
 			if line.starts_with(". NO [AUTHENTICATIONFAILED]") {
-				println!("Authentication failed, quitting");
+				error!("Authentication failed, quitting.");
 				stream.write_all(". CLOSE\r\n".as_bytes()).await?;
 			}
 
 			if line.starts_with(". BAD") {
-				println!("Sent an invalid command.");
+				error!("Sent an invalid command.");
 				stream.write_all(". CLOSE\r\n".as_bytes()).await?;
 			}
 
 			if line.starts_with("* BYE") {
-				println!("Remote said goodbye.");
+				info!("Remote said goodbye.");
 				return Ok(());
 			}
 
@@ -169,13 +173,15 @@ async fn run<'a>(
 							vec!["FLAGS", &opt.user, &get_flags(&line)?.unwrap()],
 						)?;
 
-						println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
+						debug!("STDOUT: {}", output.0);
+						debug!("STDERR: {}", output.1);
 					}
 
 					if line.contains(" EXISTS") {
 						let output = call_command(&opt.script, vec!["EXISTS", &opt.user])?;
 
-						println!("STDOUT: {}\nSTDERR: {}", output.0, output.1);
+						debug!("STDOUT: {}", output.0);
+						debug!("STDERR: {}", output.1);
 					}
 
 					Idle
