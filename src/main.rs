@@ -2,6 +2,7 @@ use std::io;
 use std::io::BufReader;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -40,9 +41,9 @@ struct Options {
     /// Password to use for authentication.
     pass: String,
 
-    /// IMAP folder to watch for updates.
+    /// IMAP folders to watch for updates.
     folder: String,
-
+    // folder: Vec<String>,
     /// Script to be ran on notify. EXISTS is passed on new email, FLAGS with the flags are passed on read/update/delete.
     #[structopt(parse(from_os_str))]
     script: PathBuf,
@@ -75,20 +76,29 @@ fn main() -> Result<(), Error> {
             .root_store
             .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
     }
-    let connector = TlsConnector::from(std::sync::Arc::new(config));
-    let host = opt.host.clone();
-    let domain = DNSNameRef::try_from_ascii_str(&host)
-        .map_err(|e| format_err!("error when parsing dns name '{}': {}", opt.host, e))?;
 
-    runtime.block_on(run(opt, connector, domain))
+    let config = Arc::new(config);
+
+    runtime.block_on(watch(
+        opt.host, opt.folder, opt.user, opt.pass, opt.script, config,
+    ))
 }
 
-async fn run<'a>(
-    opt: Options,
-    connector: TlsConnector,
-    domain: DNSNameRef<'a>,
+// todo: poll @ 29 minute intervals https://tools.ietf.org/html/rfc2177 pg 1 last para
+
+async fn watch<'a>(
+    host: String,
+    folder: String,
+    user: String,
+    pass: String,
+    script: PathBuf,
+    config: Arc<ClientConfig>,
 ) -> Result<(), Error> {
-    let host = format!("{}:{}", opt.host, opt.port)
+    let connector = TlsConnector::from(config);
+
+    let domain = DNSNameRef::try_from_ascii_str(&host)
+        .map_err(|e| format_err!("error when parsing dns name '{}': {}", host, e))?;
+    let host = host
         .to_socket_addrs()?
         .next()
         .ok_or(format_err!("Unable to parse host"))?;
@@ -96,7 +106,7 @@ async fn run<'a>(
     let stream = TcpStream::connect(host).await?;
     let mut stream = connector.connect(domain, stream).await?;
 
-    let mut state = State::Login(&opt.user, &opt.pass);
+    let mut state = State::Login(&user, &pass);
 
     loop {
         let mut buff = std::vec::Vec::with_capacity(1024 * 1024);
@@ -139,7 +149,7 @@ async fn run<'a>(
                 }
                 WaitAuthenticated => {
                     if line.contains("Logged in") {
-                        SelectFolder(&opt.folder)
+                        SelectFolder(&folder)
                     } else {
                         WaitAuthenticated
                     }
@@ -176,8 +186,8 @@ async fn run<'a>(
                     if line.contains("FETCH (FLAGS") {
                         info!("Calling script");
                         let output = call_command(
-                            &opt.script,
-                            vec!["FLAGS", &opt.user, &opt.folder, &get_flags(&line)?.unwrap()],
+                            &script,
+                            vec!["FLAGS", &user, &folder, &get_flags(&line)?.unwrap()],
                         )?;
 
                         debug!("STDOUT: {}", output.0);
@@ -186,8 +196,7 @@ async fn run<'a>(
 
                     if line.contains(" EXISTS") {
                         info!("Calling script");
-                        let output =
-                            call_command(&opt.script, vec!["EXISTS", &opt.user, &opt.folder])?;
+                        let output = call_command(&script, vec!["EXISTS", &user, &folder])?;
 
                         debug!("STDOUT: {}", output.0);
                         debug!("STDERR: {}", output.1);
@@ -200,10 +209,11 @@ async fn run<'a>(
     }
 }
 
-fn call_command<T, S>(command: &PathBuf, args: T) -> Result<(String, String), Error>
+fn call_command<T, S, R>(command: &R, args: T) -> Result<(String, String), Error>
 where
     T: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
+    R: AsRef<std::ffi::OsStr>,
 {
     use std::process::Command;
     let output = Command::new(command)
