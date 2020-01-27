@@ -7,7 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "0.2.9", features = [ "io-util", "io-std", "tcp" ] }
+tokio = { version = "0.2.6", features = [ "io-util", "io-std", "tcp" ] }
 
 failure = "0.1.6"
 log = "0.4"

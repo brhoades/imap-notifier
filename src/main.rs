@@ -1,13 +1,17 @@
+use futures::stream::Stream;
 use std::io;
 use std::io::BufReader;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::task::Poll::{Pending, Ready};
 use structopt::StructOpt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime;
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSNameRef, TlsConnector};
+
+use futures::future::FutureExt;
 
 use failure::{format_err, Error};
 use log::{debug, error, info};
@@ -104,91 +108,101 @@ async fn watch<'a>(
         .ok_or(format_err!("Unable to parse host"))?;
 
     let stream = TcpStream::connect(host).await?;
-    let mut stream = connector.connect(domain, stream).await?;
+    let stream = connector.connect(domain, stream).await?;
+    let (mut read, mut write) = tokio::io::split(stream);
+
+    let read_stream = futures::stream::poll_fn(move |ctx| {
+        use std::future::Future;
+
+        let mut buff = vec![];
+
+        while let Ready(Ok(c)) = Future::poll(std::pin::Pin::new(&mut read.read_u8()), ctx) {
+            if c == '\r' as u8 || c == '\n' as u8 {
+                break;
+            }
+
+            buff.push(c);
+        }
+
+        if buff.len() > 0 {
+            Ready(String::from_utf8(buff).ok())
+        } else {
+            Pending
+        }
+    });
+
+    use futures_util::stream::StreamExt;
 
     let mut state = State::Login(&user, &pass);
-
-    loop {
-        let mut buff = std::vec::Vec::with_capacity(1024 * 1024);
-        buff.resize(128, 0);
-
-        stream.read(&mut buff).await?;
-
-        let lines = buff
-            .split(|c| *c == '\r' as u8 || *c == '\n' as u8)
-            .filter(|e| e.len() != 0)
-            .map(std::str::from_utf8);
-
-        for incoming_line in lines {
-            let line = incoming_line?;
-
-            info!("-> {}", line.replace("\r\n", ""));
+    let stream = read_stream
+        .then(|line| {
+            info!("-> {}", line);
 
             if line.starts_with(". NO [AUTHENTICATIONFAILED]") {
                 error!("Authentication failed, quitting.");
-                stream.write_all(". CLOSE\r\n".as_bytes()).await?;
+                return futures::future::ok(Some(". CLOSE".to_owned()));
             }
 
             if line.starts_with(". BAD") {
                 error!("Sent an invalid command.");
-                stream.write_all(". CLOSE\r\n".as_bytes()).await?;
+                return futures::future::ok(Some(". CLOSE".to_owned()));
             }
 
             if line.starts_with("* BYE") {
                 info!("Remote said goodbye.");
-                return Ok(());
+                return futures::future::err(format_err!("remote hung up"));
             }
 
             use State::*;
-            state = match state {
+            match state {
                 Login(user, pass) => {
-                    stream
-                        .write_all(format!(". LOGIN \"{}\" \"{}\"\r\n", user, pass).as_bytes())
-                        .await?;
-                    WaitAuthenticated
+                    state = WaitAuthenticated;
+                    return futures::future::ok(Some(format!(". LOGIN \"{}\" \"{}\"", user, pass)));
                 }
                 WaitAuthenticated => {
-                    if line.contains("Logged in") {
+                    state = if line.contains("Logged in") {
                         SelectFolder(&folder)
                     } else {
                         WaitAuthenticated
-                    }
+                    };
+                    return futures::future::ok(None);
                 }
                 SelectFolder(folder) => {
-                    stream
-                        .write_all(format!(". select {}\r\n", folder).as_bytes())
-                        .await?;
-
-                    WaitSelected
+                    state = WaitSelected;
+                    return futures::future::ok(Some(". select ".to_owned() + folder));
                 }
                 WaitSelected => {
-                    if line.contains("Select completed") {
+                    state = if line.contains("Select completed") {
                         RequestIdle
                     } else {
                         WaitSelected
-                    }
+                    };
+                    return futures::future::ok(None);
                 }
                 RequestIdle => {
-                    stream.write_all(". idle\r\n".as_bytes()).await?;
-
+                    state = WaitIdle;
                     info!("waiting for idling confirmation");
-                    WaitIdle
+
+                    return futures::future::ok(Some(". idle".to_owned()));
                 }
                 WaitIdle => {
-                    if line.contains("+ idling") {
+                    state = if line.contains("+ idling") {
                         info!("idle confirmed");
                         Idle
                     } else {
                         WaitIdle
-                    }
+                    };
+
+                    return futures::future::ok(None);
                 }
                 Idle => {
                     if line.contains("FETCH (FLAGS") {
                         info!("Calling script");
                         let output = call_command(
                             &script,
-                            vec!["FLAGS", &user, &folder, &get_flags(&line)?.unwrap()],
-                        )?;
+                            vec!["FLAGS", &user, &folder, &get_flags(&line).unwrap().unwrap()],
+                        )
+                        .unwrap();
 
                         debug!("STDOUT: {}", output.0);
                         debug!("STDERR: {}", output.1);
@@ -196,17 +210,39 @@ async fn watch<'a>(
 
                     if line.contains(" EXISTS") {
                         info!("Calling script");
-                        let output = call_command(&script, vec!["EXISTS", &user, &folder])?;
+                        let output = call_command(&script, vec!["EXISTS", &user, &folder]).unwrap();
 
                         debug!("STDOUT: {}", output.0);
                         debug!("STDERR: {}", output.1);
                     }
 
-                    Idle
+                    return futures::future::ok(None);
                 }
-            };
+            }
+        })
+        .filter(|v| futures::future::ready(!(v.is_ok() && v.as_ref().unwrap().is_none())));
+
+    for res in futures::executor::block_on_stream(stream) {
+        match res {
+            Ok(Some(out)) => {
+                let len = out.len();
+                let size = write.write((out + "\r\n").as_bytes()).await?;
+                if len != size {
+                    return Err(format_err!(
+                        "written size differs from actual: {} != {}",
+                        size,
+                        len
+                    ));
+                }
+            }
+            Ok(None) => (),
+            Err(e) => {
+                return Err(format_err!("err: {}", e));
+            }
         }
     }
+
+    Ok(())
 }
 
 fn call_command<T, S, R>(command: &R, args: T) -> Result<(String, String), Error>
