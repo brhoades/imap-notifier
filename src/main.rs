@@ -1,4 +1,3 @@
-use futures::stream::Stream;
 use std::io;
 use std::io::BufReader;
 use std::net::ToSocketAddrs;
@@ -6,15 +5,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::Poll::{Pending, Ready};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::runtime;
+use tokio::prelude::*;
 use tokio_rustls::{rustls::ClientConfig, webpki::DNSNameRef, TlsConnector};
 
 use futures::future::FutureExt;
+use serde::Deserialize;
+
+use slog::{debug, error, info, o, trace, Logger};
 
 use failure::{format_err, Error};
-use log::{debug, error, info};
 
 enum State<'a, 'b, 'c> {
     Login(&'a String, &'b String),
@@ -26,18 +27,18 @@ enum State<'a, 'b, 'c> {
     Idle,
 }
 
-#[derive(Debug, StructOpt)]
-#[structopt(
-    name = "imap-notifier",
-    about = "Runs a script when an email arrives to the folder or the folder's emails change."
-)]
-struct Options {
+#[derive(Deserialize, Debug)]
+struct Config {
+    accounts: Vec<Account>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Account {
     /// Host of IMAP server.
     host: String,
 
     /// Port for IMAP server.
-    #[structopt(short = "p", long = "port", default_value = "993")]
-    port: i16,
+    port: Option<i16>,
 
     /// Username to use for authentication.
     user: String,
@@ -46,8 +47,23 @@ struct Options {
     pass: String,
 
     /// IMAP folders to watch for updates.
-    folder: String,
-    // folder: Vec<String>,
+    folders: Vec<Folder>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Folder {
+    name: String,
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "imap-notifier",
+    about = "Runs a script when an email arrives to the folder or the folder's emails change."
+)]
+struct Options {
+    #[structopt(short = "c", long = "config", default_value = "config.json")]
+    config: std::path::PathBuf,
+
     /// Script to be ran on notify. EXISTS is passed on new email, FLAGS with the flags are passed on read/update/delete.
     #[structopt(parse(from_os_str))]
     script: PathBuf,
@@ -58,15 +74,14 @@ struct Options {
 }
 
 fn main() -> Result<(), Error> {
-    pretty_env_logger::init();
+    let root = get_root_logger();
 
-    debug!("imap notifier start");
+    debug!(root, "imap notifier start");
     let opt = Options::from_args();
-
-    let mut runtime = runtime::Builder::new()
-        .basic_scheduler()
-        .enable_io()
-        .build()?;
+    let cfg: Config = serde_json::from_str(
+        &std::fs::read_to_string(opt.config)
+            .map_err(|e| format_err!("error reading config: {}", e))?,
+    )?;
 
     let mut config = ClientConfig::new();
     if let Some(cafile) = &opt.cafile {
@@ -80,76 +95,172 @@ fn main() -> Result<(), Error> {
             .root_store
             .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
     }
-
     let config = Arc::new(config);
 
-    runtime.block_on(watch(
-        opt.host, opt.folder, opt.user, opt.pass, opt.script, config,
-    ))
+    // Create the runtime
+    let mut rt = tokio::runtime::Builder::new()
+        .threaded_scheduler()
+        .enable_all()
+        .build()?;
+
+    // let mut tasks: Vec<_> = vec![];
+    let script = opt.script.clone();
+    let futs = cfg
+        .accounts
+        .iter()
+        .map(|account| {
+            let mut accounts = Vec::with_capacity(account.folders.len());
+            accounts.resize(account.folders.len(), account.clone());
+
+            account.folders.iter().zip(accounts).map(|(folder, acct)| {
+                rt.spawn(watch(
+                    // root.new(o!("name" => format!("{} on {}", folder.name, &folder_acct.host))),
+                    root.new(o!("name" => format!("{} on {}", folder.name, acct.host))),
+                    acct,
+                    folder.name.clone(),
+                    script.clone(),
+                    config.clone(),
+                ))
+            })
+        })
+        .flatten()
+        .collect::<Vec<_>>(); // drain to evaluate lazy iter
+
+    for f in futs {
+        println!("RUNNING FUTURE");
+        rt.block_on(f)?.unwrap();
+    }
+
+    // let mut size = tasks.len();
+
+    /*
+    let mut handle = futures::future::select_all(tasks);
+    // https://docs.rs/futures-preview/0.3.0-alpha.18/futures/future/fn.select_all.html
+    // 0 is the future that finished, futs is the reaiming ones.
+    while size > 0 {
+        debug!(root, "{} tasks remaining", size);
+        let (fut, new_size, futs) = handle.await;
+        size = new_size;
+        fut?.unwrap();
+
+        handle = futures::future::select_all(futs);
+    }
+     */
+
+    // Wait until the runtime becomes idle and shut it down.
+    Ok(())
 }
 
 // todo: poll @ 29 minute intervals https://tools.ietf.org/html/rfc2177 pg 1 last para
-
 async fn watch<'a>(
-    host: String,
+    logger: Logger,
+    account: Account,
     folder: String,
-    user: String,
-    pass: String,
     script: PathBuf,
     config: Arc<ClientConfig>,
 ) -> Result<(), Error> {
-    let connector = TlsConnector::from(config);
+    info!(logger, "starting watcher: {} on {}", folder, account.host);
 
-    let domain = DNSNameRef::try_from_ascii_str(&host)
-        .map_err(|e| format_err!("error when parsing dns name '{}': {}", host, e))?;
-    let host = host
+    let (host, port, fullhost): (&str, &str, &str) = if !account.host.contains(":") {
+        (account.host.as_str(), "993", &account.host)
+    } else {
+        let mut parts = account.host.split(':').collect::<Vec<_>>();
+        if parts.len() != 2 {
+            info!(logger, "expected exactly two host parts: {:?}", parts);
+            return Err(format_err!(
+                "expected exactly two host parts, got {} in '{}'",
+                parts.len(),
+                account.host
+            ));
+            debug!(logger, "parts: {:?}", parts);
+        }
+
+        let (host, port) = (parts[0], parts[1]);
+
+        (host, port, account.host.as_str())
+    };
+
+    let domain = DNSNameRef::try_from_ascii_str(host)
+        .map_err(|e| format_err!("error when parsing dns name '{}': {}", fullhost, e))?;
+    let host = fullhost
         .to_socket_addrs()?
         .next()
         .ok_or(format_err!("Unable to parse host"))?;
 
-    let stream = TcpStream::connect(host).await?;
-    let stream = connector.connect(domain, stream).await?;
+    debug!(logger, "starting stream");
+    let stream = TlsConnector::from(config)
+        .connect(domain, TcpStream::connect(host).await?)
+        .await?;
     let (mut read, mut write) = tokio::io::split(stream);
+    debug!(logger, "connected!");
+    let mut buff: Vec<u8> = vec![];
+    let mut first_time = true;
 
+    // Stream of Item = String separated by newlines.
     let read_stream = futures::stream::poll_fn(move |ctx| {
         use std::future::Future;
 
-        let mut buff = vec![];
+        println!("start inner: {}", String::from_utf8(buff.clone()).unwrap());
 
-        while let Ready(Ok(c)) = Future::poll(std::pin::Pin::new(&mut read.read_u8()), ctx) {
-            if c == '\r' as u8 || c == '\n' as u8 {
-                break;
+        match Future::poll(std::pin::Pin::new(&mut read.read_u8()), ctx) {
+            Pending => {
+                // need to ensure input for the first state transition.
+                println!("pending");
+                if first_time {
+                    first_time = false;
+                    Ready(Some("".to_owned()))
+                } else {
+                    Pending
+                }
             }
+            Ready(Err(e)) => {
+                println!("ERROR: {}", e);
+                Pending
+            }
+            Ready(Ok(c)) => {
+                println!("IN: {}", String::from_utf8(vec![c]).unwrap());
 
-            buff.push(c);
-        }
-
-        if buff.len() > 0 {
-            Ready(String::from_utf8(buff).ok())
-        } else {
-            Pending
+                if c == '\r' as u8 || c == '\n' as u8 {
+                    if buff.len() > 0 {
+                        let output = String::from_utf8(buff.clone()).ok().unwrap();
+                        buff.clear();
+                        println!("ready: {}", output);
+                        Ready(Some(output))
+                    } else {
+                        Pending
+                    }
+                } else {
+                    buff.push(c);
+                    println!(
+                        "pushed {}, now: {}",
+                        c,
+                        String::from_utf8(buff.clone()).unwrap()
+                    );
+                    Pending
+                }
+            }
         }
     });
 
     use futures_util::stream::StreamExt;
 
-    let mut state = State::Login(&user, &pass);
-    let stream = read_stream
+    let mut state = State::Login(&account.user, &account.pass);
+    let mut stream = read_stream
         .then(|line| {
-            info!("-> {}", line);
+            info!(logger, "-> {}", line);
 
             if line.starts_with(". NO [AUTHENTICATIONFAILED]") {
-                error!("Authentication failed, quitting.");
+                error!(logger, "Authentication failed, quitting.");
                 return futures::future::ok(Some(". CLOSE".to_owned()));
             }
 
             if line.starts_with(". BAD") {
-                error!("Sent an invalid command.");
+                error!(logger, "Sent an invalid command.");
                 return futures::future::ok(Some(". CLOSE".to_owned()));
             }
 
             if line.starts_with("* BYE") {
-                info!("Remote said goodbye.");
+                info!(logger, "Remote said goodbye.");
                 return futures::future::err(format_err!("remote hung up"));
             }
 
@@ -181,13 +292,13 @@ async fn watch<'a>(
                 }
                 RequestIdle => {
                     state = WaitIdle;
-                    info!("waiting for idling confirmation");
+                    info!(logger, "waiting for idling confirmation");
 
                     return futures::future::ok(Some(". idle".to_owned()));
                 }
                 WaitIdle => {
                     state = if line.contains("+ idling") {
-                        info!("idle confirmed");
+                        info!(logger, "idle confirmed");
                         Idle
                     } else {
                         WaitIdle
@@ -197,23 +308,29 @@ async fn watch<'a>(
                 }
                 Idle => {
                     if line.contains("FETCH (FLAGS") {
-                        info!("Calling script");
+                        info!(logger, "Calling script");
                         let output = call_command(
                             &script,
-                            vec!["FLAGS", &user, &folder, &get_flags(&line).unwrap().unwrap()],
+                            vec![
+                                "FLAGS",
+                                &account.user,
+                                &folder,
+                                &get_flags(&line).unwrap().unwrap(),
+                            ],
                         )
                         .unwrap();
 
-                        debug!("STDOUT: {}", output.0);
-                        debug!("STDERR: {}", output.1);
+                        debug!(logger, "STDOUT: {}", output.0);
+                        debug!(logger, "STDERR: {}", output.1);
                     }
 
                     if line.contains(" EXISTS") {
-                        info!("Calling script");
-                        let output = call_command(&script, vec!["EXISTS", &user, &folder]).unwrap();
+                        info!(logger, "Calling script");
+                        let output =
+                            call_command(&script, vec!["EXISTS", &account.user, &folder]).unwrap();
 
-                        debug!("STDOUT: {}", output.0);
-                        debug!("STDERR: {}", output.1);
+                        debug!(logger, "STDOUT: {}", output.0);
+                        debug!(logger, "STDERR: {}", output.1);
                     }
 
                     return futures::future::ok(None);
@@ -222,11 +339,12 @@ async fn watch<'a>(
         })
         .filter(|v| futures::future::ready(!(v.is_ok() && v.as_ref().unwrap().is_none())));
 
-    for res in futures::executor::block_on_stream(stream) {
+    while let Some(res) = stream.next().await {
         match res {
             Ok(Some(out)) => {
                 let len = out.len();
-                let size = write.write((out + "\r\n").as_bytes()).await?;
+                info!(logger, "<- {}", out.clone());
+                let size = write.write((out + "\r\n").as_bytes()).await? - 2;
                 if len != size {
                     return Err(format_err!(
                         "written size differs from actual: {} != {}",
@@ -271,4 +389,17 @@ fn get_flags(line: &str) -> Result<Option<String>, Error> {
         Some(captures) => Ok(captures.get(0).map(|v| v.as_str().to_owned())),
         None => Ok(None),
     }
+}
+
+fn get_root_logger() -> Logger {
+    use sloggers::terminal::{Destination, TerminalLoggerBuilder};
+    use sloggers::types::Severity;
+    use sloggers::Build;
+
+    let mut builder = TerminalLoggerBuilder::new();
+    builder.level(Severity::Debug);
+    builder.destination(Destination::Stderr);
+
+    let logger = builder.build().unwrap();
+    logger
 }

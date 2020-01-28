@@ -7,11 +7,13 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "0.2.6", features = [ "io-util", "io-std", "tcp" ] }
+tokio = { features = [ "macros", "io-util", "io-std", "tcp", "rt-threaded" ] }
 
 failure = "0.1.6"
-log = "0.4"
-pretty_env_logger = "0.3"
+slog = "2.5.2"
+slog-term = "2.4.2"
+slog-async = "2.3.0"
+sloggers = "0.3.5"
 
 rustls = "0.16.0"
 rustls-native-certs = "0.1.0"
@@ -21,9 +23,12 @@ structopt = { version = "0.3", features = [ "paw" ] }
 paw = "1.0"
 tokio-rustls = "0.12"
 
-futures-util = "0.3.1"
-futures-core = "0.3.1"
-futures = "0.3.1"
+futures-util = "0.3.0"
+futures-core = "0.3.0"
+futures = "0.3.0"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 url = "2.1.1"
 regex = "1"
